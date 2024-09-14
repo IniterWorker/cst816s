@@ -15,7 +15,7 @@ WIP...
 
 Please feel free to open an issue with your design improvements/considerations.
 
-## QMI8658 Sensor/Gyroscope
+## CST816S Touch Screen IC
 
 ### Support
 
