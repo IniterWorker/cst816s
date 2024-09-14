@@ -1,0 +1,45 @@
+[package]
+name = "cst816s-rs"
+categories = ["embedded", "no-std"]
+version = "0.1.0"
+edition = "2021"
+authors = ["Walter Bonetti <walter.bonetti@epitech.eu>"]
+license = "MIT OR Apache-2.0"
+description = "CST816S capacitive touch screen IC"
+keywords = ["no-std", "cst816s", "embedded", "embedded-hal-driver", "sensor"]
+include = [
+    "src/**/*.rs",
+    "crates-io.md",
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+]
+repository = "https://github.com/IniterWorker/cst816s"
+readme = "README.md"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[package.metadata.docs.rs]
+targets = ["thumbv7m-none-eabi", "thumbv7em-none-eabihf"]
+
+[dependencies]
+# Embedded HAL abstraction
+# We use this layer to abstract hardware i2c/spi
+embedded-hal = { version = "1.0.0" }
+bitfield = "0.15.0"
+log = { version = "0.4", default-features = false, optional = true }
+thiserror = { version = "1.0", default-features = false, optional = true }
+libm = { version = "0.2" }
+
+[features]
+default = []
+loglib = ["log"]
+std = ["thiserror"]
+
+[dev-dependencies.cargo-husky]
+version = "1"
+features = ["user-hooks"]
+
+[lib]
+name = "cst816s"
+path = "src/lib.rs"
