@@ -316,11 +316,11 @@ impl TouchEvents {
     /// is badly written too.
     ///
     #[must_use]
-    pub fn report_key(&self, max_x: u16, max_y: u16) -> Option<KeyEvent> {
+    pub fn report_key<const W: u16, const H: u16>(&self) -> Option<KeyEvent> {
         let mut i = 0;
 
         while i < 5 {
-            if self.points[i].y <= max_x && self.points[i].x <= max_y {
+            if self.points[i].y <= H && self.points[i].x <= W {
                 break;
             }
             i += 1;
