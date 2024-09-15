@@ -100,6 +100,11 @@ where
     D: DelayNs,
 {
     /// Create a new Cst816s driver with default I2C address.
+    ///
+    /// # Arguments
+    ///
+    /// * `interface`: the `I2c<SevenBitAddress>`
+    /// * `delay`: the `DelayNs` provider
     #[allow(clippy::missing_const_for_fn)]
     pub fn new(interface: I, delay: D) -> Self {
         Self {
