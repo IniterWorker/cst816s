@@ -1,13 +1,21 @@
-# QMI8658
+# CST816S
 
 <p align="left">
-    <a href="https://github.com/initerworker/qmi8658/actions/workflows/rust-release.yml"><img src="https://github.com/initerworker/qmi8658/actions/workflows/rust-release.yml/badge.svg" alt="Github CI/CD"></a>
-    <a href="https://crates.io/crates/qmi8658-rs"><img src="https://img.shields.io/crates/v/qmi8658-rs.svg" alt="Crates.io"></a>
-    <a href="https://docs.rs/qmi8658-rs"><img src="https://docs.rs/qmi8658-rs/badge.svg" alt="Docs.rs"></a>
+    <a href="https://github.com/initerworker/cst816s/actions/workflows/rust-release.yml"><img src="https://github.com/initerworker/cst816s/actions/workflows/rust-release.yml/badge.svg" alt="Github CI/CD"></a>
+    <a href="https://crates.io/crates/cst816s-rs"><img src="https://img.shields.io/crates/v/cst816s-rs.svg" alt="Crates.io"></a>
+    <a href="https://docs.rs/cst816s-rs"><img src="https://docs.rs/cst816s-rs/badge.svg" alt="Docs.rs"></a>
 </p>
 
-Rust implementation I2C driver of the QMI8658 Low Noise, Wide Bandwidth 6D Inertial Measurement
-Unit with Motion Co-Processor.
+Rust implementation I2C driver of the cst816s, cst816t, cst816d touch screen IC.
+
+## Disclaimer
+
+The CST816S IC firmware and documentation are incomplete and lack critical information.
+There are several undocumented magic values, features that are claimed but do not work,
+and important details that are absent from both the datasheet and the documentation.
+As a result, it is recommended to limit the usage of this IC to basic point-and-click actions.
+
+If you have any additional information, please do not hesitate to submit an issue with it.
 
 WIP...
 

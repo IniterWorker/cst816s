@@ -1,7 +1,6 @@
 # Changelog
 
-Rust implementation I2C driver of the QMI8658 Low Noise, Wide Bandwidth 6D Inertial Measurement
-Unit with Motion Co-Processor.
+Rust implementation I2C driver of the cst816s, cst816t, cst816d touch screen IC.
 
 <!-- next-header -->
 

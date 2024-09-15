@@ -2,7 +2,7 @@ target_dir := "target"
 
 doc_dir := "doc"
 doc_assets_dir := doc_dir + "/assets"
-project_name := "qmi8658"
+project_name := "cst816s"
 
 #----------
 # Building
