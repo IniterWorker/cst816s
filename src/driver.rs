@@ -4,7 +4,7 @@ use embedded_hal::{
     i2c::{I2c, SevenBitAddress},
 };
 
-use crate::command::{constants, IrqCtl, MotionMask, Register, TouchEvent};
+use crate::command::{constants, IrqCtl, MotionMask, Register, TouchEvent, TouchEvents};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
@@ -150,7 +150,7 @@ where
         Register::DeepSleep.write(
             &mut self.interface,
             self.addr.into(),
-            constants::CST816S_REG_DEEP_SLEEP,
+            constants::CST78XX_CMD_DEEP_SLEEP,
         )?;
         Ok(())
     }
@@ -163,6 +163,16 @@ where
     pub fn read_motion_mask(&mut self) -> Result<MotionMask, Error<I::Error>> {
         let data = Register::MotionMask.read(&mut self.interface, self.addr.into())?;
         Ok(MotionMask(data))
+    }
+
+    /// Writes Motion Mask
+    ///
+    /// # Errors
+    ///
+    /// This method may return an error if there are communication issues with the sensor.
+    pub fn write_motion_mask(&mut self, value: MotionMask) -> Result<(), Error<I::Error>> {
+        Register::MotionMask.write(&mut self.interface, self.addr.into(), value.0)?;
+        Ok(())
     }
 
     /// Returns Interrupt low-pluse output width
@@ -433,6 +443,16 @@ where
         Ok(Register::AutoReset.read(&mut self.interface, self.addr.into())?)
     }
 
+    /// Writes Automatically reset if there is touch but no valid gesture within x seconds. Unit: 1S, Disable: 0, Default:
+    ///
+    /// # Errors
+    ///
+    /// This method may return an error if there are communication issues with the sensor.
+    pub fn write_auto_reset(&mut self, value: u8) -> Result<(), Error<I::Error>> {
+        Register::AutoReset.write(&mut self.interface, self.addr.into(), value)?;
+        Ok(())
+    }
+
     /// Returns Auto reset after long press x secondsUnit: 1S, Disable: 0, Default: 10
     ///
     /// # Errors
@@ -440,6 +460,16 @@ where
     /// This method may return an error if there are communication issues with the sensor.
     pub fn read_long_press_time(&mut self) -> Result<u8, Error<I::Error>> {
         Ok(Register::LongPressTime.read(&mut self.interface, self.addr.into())?)
+    }
+
+    /// Writes Auto reset after long press x secondsUnit: 1S, Disable: 0, Default: 10
+    ///
+    /// # Errors
+    ///
+    /// This method may return an error if there are communication issues with the sensor.
+    pub fn write_long_press_time(&mut self, value: u8) -> Result<(), Error<I::Error>> {
+        Register::LongPressTime.write(&mut self.interface, self.addr.into(), value)?;
+        Ok(())
     }
 
     /// Returns 0 by default, enable automatic entryintolow-power mode
@@ -459,5 +489,14 @@ where
     /// This method may return an error if there are communication issues with the sensor.
     pub fn read_event(&mut self) -> Result<TouchEvent, Error<I::Error>> {
         Ok(TouchEvent::read(&mut self.interface, self.addr.into())?)
+    }
+
+    /// Returns the [`TouchEvents`] if it is availabe.
+    ///
+    /// # Errors
+    ///
+    /// This method may return an error if there are communication issues with the sensor.
+    pub fn read_events(&mut self) -> Result<TouchEvents, Error<I::Error>> {
+        Ok(TouchEvents::read(&mut self.interface, self.addr.into())?)
     }
 }
