@@ -160,7 +160,7 @@ impl Register {
 ///
 /// The chip is blank when it leaves the factory, IIC is not connected, there is no chip ID, and
 /// the value can only be read after burning and upgrading the firmeware.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ChipId {
     Factory = 0x00,
     Cst716 = 0x20,
@@ -169,7 +169,7 @@ pub enum ChipId {
     Cst816d = 0xB6,
 }
 
-#[derive(Debug, PartialEq, Eq, Default)]
+#[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
 /// CST816S Touch event touch state
 pub enum Touch {
     #[default]
@@ -190,7 +190,7 @@ impl From<u8> for Touch {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Default)]
+#[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
 /// CST816S Gesture types
 pub enum Gesture {
     /// No gesture detected
@@ -227,7 +227,7 @@ impl From<u8> for Gesture {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct TouchEvents {
     pub points: [TouchEvent; 10],
     pub number_points: u8,
@@ -359,7 +359,7 @@ pub struct KeyEvent {
     pub state: KeyState,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct TouchEvent {
     /// Touch id
     pub touch_id: u8,
