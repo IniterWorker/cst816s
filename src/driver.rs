@@ -1,507 +1,612 @@
-use embedded_hal::{
-    delay::DelayNs,
-    digital::OutputPin,
-    i2c::{I2c, SevenBitAddress},
-};
+//! Blocking CST816 driver.
 
-use crate::command::{constants, IrqCtl, MotionMask, Register, TouchEvent, TouchEvents};
+use embedded_hal::delay::DelayNs;
+use embedded_hal::digital::OutputPin;
+use embedded_hal::i2c::I2c;
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy)]
-pub enum DeviceAddress {
-    Primary = 0x15,
+use crate::config::{Config, IoCtl, IrqCtl, LowPowerConfig, MotionMask, ReportMode};
+use crate::data::{ChipId, CoordinateTransform, DeviceInfo, TouchReport};
+use crate::error::Error;
+use crate::interface::{DeviceAddress, I2cInterface, NoPin, RegisterIo};
+use crate::registers::{REG_DATA_START, RESET_LOW_MS, RESET_SETTLE_MS, Register, SLEEP_COMMAND};
+
+#[inline]
+fn check_range(value: u8, range: core::ops::RangeInclusive<u8>) -> Result<(), ()> {
+    if range.contains(&value) {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
-impl From<DeviceAddress> for u8 {
-    fn from(value: DeviceAddress) -> Self {
-        match value {
-            DeviceAddress::Primary => 0x15,
+/// Blocking CST816 driver over I2C.
+///
+/// `RST`/`INT` default to [`NoPin`]; attach real pins with
+/// [`with_reset_pin`](Self::with_reset_pin) /
+/// [`with_interrupt_pin`](Self::with_interrupt_pin).
+pub struct Cst816s<I, D, RST = NoPin, INT = NoPin> {
+    io: I2cInterface<I>,
+    delay: D,
+    rst: RST,
+    int: INT,
+    config: Config,
+    chip: Option<ChipId>,
+    transform: CoordinateTransform,
+    width: u16,
+    height: u16,
+}
+
+impl<I, D, RST, INT> core::fmt::Debug for Cst816s<I, D, RST, INT> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Cst816s")
+            .field("chip", &self.chip)
+            .field("config", &self.config)
+            .field("transform", &self.transform)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<I, D> Cst816s<I, D, NoPin, NoPin> {
+    /// New driver at the primary address, no pins attached.
+    pub fn new(bus: I, delay: D) -> Self {
+        Self::new_with_address(bus, DeviceAddress::Primary, delay)
+    }
+
+    /// New driver with an explicit address, no pins attached.
+    pub fn new_with_address(bus: I, address: DeviceAddress, delay: D) -> Self {
+        Self {
+            io: I2cInterface::new(bus, address),
+            delay,
+            rst: NoPin,
+            int: NoPin,
+            config: Config::default(),
+            chip: None,
+            transform: CoordinateTransform::default(),
+            width: 240,
+            height: 240,
         }
     }
 }
 
-impl Default for DeviceAddress {
-    fn default() -> Self {
-        Self::Primary
+impl<I, D, RST, INT> Cst816s<I, D, RST, INT> {
+    /// Attach a reset pin (retypes the driver).
+    pub fn with_reset_pin<R2: OutputPin>(self, pin: R2) -> Cst816s<I, D, R2, INT> {
+        Cst816s {
+            io: self.io,
+            delay: self.delay,
+            rst: pin,
+            int: self.int,
+            config: self.config,
+            chip: self.chip,
+            transform: self.transform,
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    /// Attach an interrupt pin (retypes the driver).
+    pub fn with_interrupt_pin<N2>(self, pin: N2) -> Cst816s<I, D, RST, N2> {
+        Cst816s {
+            io: self.io,
+            delay: self.delay,
+            rst: self.rst,
+            int: pin,
+            config: self.config,
+            chip: self.chip,
+            transform: self.transform,
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    /// Replace the stored configuration (applied by `init`/`wake`).
+    #[must_use]
+    pub fn with_config(mut self, config: Config) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Set the coordinate transform and panel dimensions.
+    #[must_use]
+    pub fn with_transform(
+        mut self,
+        transform: CoordinateTransform,
+        width: u16,
+        height: u16,
+    ) -> Self {
+        self.transform = transform;
+        self.width = width;
+        self.height = height;
+        self
+    }
+
+    /// Release bus, delay, and pins.
+    pub fn release(self) -> (I, D, RST, INT) {
+        (self.io.bus, self.delay, self.rst, self.int)
+    }
+
+    /// Chip identified by the last `probe`/`init`, if any.
+    #[must_use]
+    pub fn chip(&self) -> Option<ChipId> {
+        self.chip
+    }
+
+    /// Stored configuration.
+    #[must_use]
+    pub fn config(&self) -> Config {
+        self.config
     }
 }
 
-/// `Cst816s` driver's `Error`
-#[derive(Debug)]
-#[cfg_attr(feature = "std", derive(thiserror::Error))]
-pub enum Error<E> {
-    /// Error related to the driver communication
-    #[cfg_attr(feature = "std", error("Error communication: {0:?}"))]
-    Communication(E),
-}
-
-impl<E> From<E> for Error<E> {
-    fn from(value: E) -> Self {
-        Self::Communication(value)
-    }
-}
-
-/// Cst816s Driver
-pub struct Cst816s<I, D> {
-    /// I2C Interface
-    pub(crate) interface: I,
-    /// I2C Address
-    pub(crate) addr: DeviceAddress,
-    /// Delay
-    pub(crate) _delay: D,
-}
-
-impl<I, D> Cst816s<I, D>
+impl<I, D, RST, INT> Cst816s<I, D, RST, INT>
 where
-    I: I2c<SevenBitAddress>,
+    I: I2c,
     D: DelayNs,
+    RST: OutputPin,
 {
-    /// Reset the IC.
-    ///
-    ///
-    /// # Errors
-    ///
-    /// See `OutputPin` definition for more information.
-    #[allow(clippy::needless_pass_by_ref_mut)]
-    pub fn reset<RST, DELAY>(&mut self, rst: &mut RST, delay: &mut DELAY) -> Result<(), RST::Error>
-    where
-        RST: OutputPin,
-        DELAY: DelayNs,
-    {
-        rst.set_low()?;
-        delay.delay_ms(constants::CST78XX_RESET_DURATION_LOW_MS);
-        rst.set_high()?;
-        delay.delay_ms(constants::CST78XX_RESET_DURATION_HIGH_MS);
+    /// Pulse RST low for 10 ms, release, settle 100 ms.
+    pub fn reset(&mut self) -> Result<(), Error<I::Error, RST::Error>> {
+        self.rst.set_low().map_err(Error::Pin)?;
+        self.delay.delay_ms(RESET_LOW_MS);
+        self.rst.set_high().map_err(Error::Pin)?;
+        self.delay.delay_ms(RESET_SETTLE_MS);
         Ok(())
     }
 
-    /// Wake UP the IC
-    ///
-    /// # Errors
-    ///
-    /// See `OutputPin` definition for more information.
-    #[allow(clippy::needless_pass_by_ref_mut)]
-    pub fn wake_up<RST, DELAY>(
+    /// Identify the chip. Unknown IDs are not an error; only bus
+    /// errors fail. Stores the chip for sleep-register selection.
+    pub fn probe(&mut self) -> Result<DeviceInfo, Error<I::Error, RST::Error>> {
+        let chip_raw = self.io.read_register(Register::ChipId.addr())?;
+        let (chip, firmware_version) = if chip_raw != 0x00 {
+            let fw = self.io.read_register(Register::FirmwareVersion.addr())?;
+            (ChipId::from_chip_register(chip_raw), fw)
+        } else {
+            let factory = self.io.read_register(Register::FactoryId.addr())?;
+            let fw = self.io.read_register(Register::FirmwareVersionAlt.addr())?;
+            (ChipId::from_factory_register(factory), fw)
+        };
+        let project_id = self.io.read_register(Register::ProjectId.addr())?;
+        self.chip = Some(chip);
+        let info = DeviceInfo {
+            chip,
+            project_id,
+            firmware_version,
+        };
+        #[cfg(feature = "log")]
+        log::debug!("cst816s probe: {info:?}");
+        Ok(info)
+    }
+
+    /// Reset, probe, and apply stored configuration.
+    pub fn init(&mut self) -> Result<DeviceInfo, Error<I::Error, RST::Error>> {
+        self.reset()?;
+        let info = self.probe()?;
+        self.apply_config()?;
+        Ok(info)
+    }
+
+    /// Read one touch frame; coordinates pass through the configured
+    /// transform. Returned unfiltered.
+    pub fn read_touch(&mut self) -> Result<TouchReport, Error<I::Error, RST::Error>> {
+        let mut frame = [0u8; 6];
+        self.io.read_registers(REG_DATA_START, &mut frame)?;
+        let mut report = TouchReport::from_frame(frame);
+        let (x, y) = self
+            .transform
+            .apply(report.x, report.y, self.width, self.height);
+        report.x = x;
+        report.y = y;
+        #[cfg(feature = "log")]
+        log::trace!("cst816s touch: {report:?}");
+        Ok(report)
+    }
+
+    /// Enter deep sleep. Resets first: in low-power auto-sleep the
+    /// I2C interface NACKs (vendor debug doc §3).
+    pub fn enter_deep_sleep(&mut self) -> Result<(), Error<I::Error, RST::Error>> {
+        self.reset()?;
+        let reg = self.chip.unwrap_or(ChipId::Cst816s).sleep_register();
+        self.io.write_register(reg.addr(), SLEEP_COMMAND)?;
+        Ok(())
+    }
+
+    /// Wake from deep sleep: full re-init (reset restores register
+    /// defaults, so configuration is re-applied).
+    pub fn wake(&mut self) -> Result<(), Error<I::Error, RST::Error>> {
+        let _ = self.init()?;
+        Ok(())
+    }
+
+    /// Escape hatch: read any register.
+    pub fn read_register(&mut self, reg: Register) -> Result<u8, Error<I::Error, RST::Error>> {
+        Ok(self.io.read_register(reg.addr())?)
+    }
+
+    /// Escape hatch: write any register.
+    pub fn write_register(
         &mut self,
-        rst: &mut RST,
-        delay: &mut DELAY,
-    ) -> Result<(), RST::Error>
-    where
-        RST: OutputPin,
-        DELAY: DelayNs,
-    {
-        self.reset(rst, delay)
+        reg: Register,
+        value: u8,
+    ) -> Result<(), Error<I::Error, RST::Error>> {
+        self.io.write_register(reg.addr(), value)?;
+        Ok(())
+    }
+
+    /// Write the stored configuration, in the fixed order:
+    /// MotionMask, IrqPulseWidth, NormalScanPeriod, MotionSlideAngle,
+    /// AutoSleepTime, IrqCtl, AutoReset, LongPressTime,
+    /// DisableAutoSleep. (IoCtl excluded on purpose.)
+    pub fn apply_config(&mut self) -> Result<(), Error<I::Error, RST::Error>> {
+        let c = self.config;
+        self.set_motion_mask(c.motion_mask)?;
+        self.set_irq_pulse_width(c.irq_pulse_width)?;
+        self.set_normal_scan_period(c.normal_scan_period)?;
+        self.set_motion_slide_angle(c.motion_slide_angle)?;
+        self.set_auto_sleep_time(c.auto_sleep_time_s)?;
+        self.set_irq_ctl(c.irq_ctl)?;
+        self.set_auto_reset(c.auto_reset_s)?;
+        self.set_long_press_time(c.long_press_time_s)?;
+        self.set_disable_auto_sleep(c.disable_auto_sleep)?;
+        Ok(())
+    }
+
+    /// Write the low-power profile: calibrated scan references only
+    /// if set, then one 5-byte burst from LpAutoWakeTime.
+    pub fn apply_low_power_config(
+        &mut self,
+        lp: &LowPowerConfig,
+    ) -> Result<(), Error<I::Error, RST::Error>> {
+        check_range(lp.auto_wake_time_min, 1..=5).map_err(|()| Error::InvalidValue)?;
+        if let Some(v) = lp.scan_raw1 {
+            self.set_lp_scan_raw1(v)?;
+        }
+        if let Some(v) = lp.scan_raw2 {
+            self.set_lp_scan_raw2(v)?;
+        }
+        let frame = [
+            Register::LpAutoWakeTime.addr(),
+            lp.auto_wake_time_min,
+            lp.scan_threshold,
+            lp.scan_window,
+            lp.scan_frequency,
+            lp.scan_idac,
+        ];
+        self.io.write_frame(&frame)?;
+        Ok(())
+    }
+
+    fn get_u8(&mut self, reg: Register) -> Result<u8, Error<I::Error, RST::Error>> {
+        Ok(self.io.read_register(reg.addr())?)
+    }
+
+    fn set_u8(&mut self, reg: Register, value: u8) -> Result<(), Error<I::Error, RST::Error>> {
+        self.io.write_register(reg.addr(), value)?;
+        Ok(())
+    }
+
+    /// Read MotionMask.
+    pub fn motion_mask(&mut self) -> Result<MotionMask, Error<I::Error, RST::Error>> {
+        Ok(MotionMask::from_raw(self.get_u8(Register::MotionMask)?))
+    }
+    /// Write MotionMask.
+    pub fn set_motion_mask(
+        &mut self,
+        value: MotionMask,
+    ) -> Result<(), Error<I::Error, RST::Error>> {
+        self.config.motion_mask = value;
+        self.set_u8(Register::MotionMask, value.to_raw())
+    }
+
+    /// Read IRQ pulse width.
+    pub fn irq_pulse_width(&mut self) -> Result<u8, Error<I::Error, RST::Error>> {
+        self.get_u8(Register::IrqPulseWidth)
+    }
+    /// Write IRQ pulse width, 1..=200.
+    pub fn set_irq_pulse_width(&mut self, value: u8) -> Result<(), Error<I::Error, RST::Error>> {
+        check_range(value, 1..=200).map_err(|()| Error::InvalidValue)?;
+        self.config.irq_pulse_width = value;
+        self.set_u8(Register::IrqPulseWidth, value)
+    }
+
+    /// Read normal scan period.
+    pub fn normal_scan_period(&mut self) -> Result<u8, Error<I::Error, RST::Error>> {
+        self.get_u8(Register::NormalScanPeriod)
+    }
+    /// Write normal scan period, 1..=30.
+    pub fn set_normal_scan_period(&mut self, value: u8) -> Result<(), Error<I::Error, RST::Error>> {
+        check_range(value, 1..=30).map_err(|()| Error::InvalidValue)?;
+        self.config.normal_scan_period = value;
+        self.set_u8(Register::NormalScanPeriod, value)
+    }
+
+    /// Read motion slide angle.
+    pub fn motion_slide_angle(&mut self) -> Result<u8, Error<I::Error, RST::Error>> {
+        self.get_u8(Register::MotionSlideAngle)
+    }
+    /// Write motion slide angle.
+    pub fn set_motion_slide_angle(&mut self, value: u8) -> Result<(), Error<I::Error, RST::Error>> {
+        self.config.motion_slide_angle = value;
+        self.set_u8(Register::MotionSlideAngle, value)
+    }
+
+    /// Read low-power scan reference 1 (big-endian H/L pair).
+    pub fn lp_scan_raw1(&mut self) -> Result<u16, Error<I::Error, RST::Error>> {
+        let h = self.get_u8(Register::LpScanRaw1H)?;
+        let l = self.get_u8(Register::LpScanRaw1L)?;
+        Ok(u16::from_be_bytes([h, l]))
+    }
+    /// Write low-power scan reference 1 (big-endian H/L pair).
+    pub fn set_lp_scan_raw1(&mut self, value: u16) -> Result<(), Error<I::Error, RST::Error>> {
+        self.set_u8(Register::LpScanRaw1H, (value >> 8) as u8)?;
+        self.set_u8(Register::LpScanRaw1L, value as u8)
+    }
+
+    /// Read low-power scan reference 2 (big-endian H/L pair).
+    pub fn lp_scan_raw2(&mut self) -> Result<u16, Error<I::Error, RST::Error>> {
+        let h = self.get_u8(Register::LpScanRaw2H)?;
+        let l = self.get_u8(Register::LpScanRaw2L)?;
+        Ok(u16::from_be_bytes([h, l]))
+    }
+    /// Write low-power scan reference 2 (big-endian H/L pair).
+    pub fn set_lp_scan_raw2(&mut self, value: u16) -> Result<(), Error<I::Error, RST::Error>> {
+        self.set_u8(Register::LpScanRaw2H, (value >> 8) as u8)?;
+        self.set_u8(Register::LpScanRaw2L, value as u8)
+    }
+
+    /// Read low-power auto-wake time (minutes).
+    pub fn lp_auto_wake_time(&mut self) -> Result<u8, Error<I::Error, RST::Error>> {
+        self.get_u8(Register::LpAutoWakeTime)
+    }
+    /// Write low-power auto-wake time, 1..=5 minutes.
+    pub fn set_lp_auto_wake_time(&mut self, value: u8) -> Result<(), Error<I::Error, RST::Error>> {
+        check_range(value, 1..=5).map_err(|()| Error::InvalidValue)?;
+        self.set_u8(Register::LpAutoWakeTime, value)
+    }
+
+    /// Read low-power scan threshold.
+    pub fn lp_scan_threshold(&mut self) -> Result<u8, Error<I::Error, RST::Error>> {
+        self.get_u8(Register::LpScanThreshold)
+    }
+    /// Write low-power scan threshold.
+    pub fn set_lp_scan_threshold(&mut self, value: u8) -> Result<(), Error<I::Error, RST::Error>> {
+        self.set_u8(Register::LpScanThreshold, value)
+    }
+
+    /// Read low-power scan window.
+    pub fn lp_scan_window(&mut self) -> Result<u8, Error<I::Error, RST::Error>> {
+        self.get_u8(Register::LpScanWindow)
+    }
+    /// Write low-power scan window. Documented 0..=3, but values
+    /// above 3 are observed working (Zephyr binding); all accepted.
+    pub fn set_lp_scan_window(&mut self, value: u8) -> Result<(), Error<I::Error, RST::Error>> {
+        self.set_u8(Register::LpScanWindow, value)
+    }
+
+    /// Read low-power scan frequency.
+    pub fn lp_scan_frequency(&mut self) -> Result<u8, Error<I::Error, RST::Error>> {
+        self.get_u8(Register::LpScanFrequency)
+    }
+    /// Write low-power scan frequency.
+    pub fn set_lp_scan_frequency(&mut self, value: u8) -> Result<(), Error<I::Error, RST::Error>> {
+        self.set_u8(Register::LpScanFrequency, value)
+    }
+
+    /// Read low-power scan IDAC.
+    pub fn lp_scan_idac(&mut self) -> Result<u8, Error<I::Error, RST::Error>> {
+        self.get_u8(Register::LpScanIdac)
+    }
+    /// Write low-power scan IDAC.
+    pub fn set_lp_scan_idac(&mut self, value: u8) -> Result<(), Error<I::Error, RST::Error>> {
+        self.set_u8(Register::LpScanIdac, value)
+    }
+
+    /// Read auto sleep time (seconds).
+    pub fn auto_sleep_time(&mut self) -> Result<u8, Error<I::Error, RST::Error>> {
+        self.get_u8(Register::AutoSleepTime)
+    }
+    /// Write auto sleep time (seconds).
+    pub fn set_auto_sleep_time(&mut self, value: u8) -> Result<(), Error<I::Error, RST::Error>> {
+        self.config.auto_sleep_time_s = value;
+        self.set_u8(Register::AutoSleepTime, value)
+    }
+
+    /// Read IRQ control.
+    pub fn irq_ctl(&mut self) -> Result<IrqCtl, Error<I::Error, RST::Error>> {
+        Ok(IrqCtl::from_raw(self.get_u8(Register::IrqCtl)?))
+    }
+    /// Write IRQ control.
+    pub fn set_irq_ctl(&mut self, value: IrqCtl) -> Result<(), Error<I::Error, RST::Error>> {
+        self.config.irq_ctl = value;
+        self.set_u8(Register::IrqCtl, value.to_raw())
+    }
+
+    /// Write a [`ReportMode`] preset to IrqCtl. Verify via
+    /// [`irq_ctl`](Self::irq_ctl); there is no mode getter.
+    pub fn set_report_mode(&mut self, mode: ReportMode) -> Result<(), Error<I::Error, RST::Error>> {
+        let raw = mode.irq_ctl_raw();
+        self.config.irq_ctl = IrqCtl::from_raw(raw);
+        self.set_u8(Register::IrqCtl, raw)
+    }
+
+    /// Read auto reset time (seconds).
+    pub fn auto_reset(&mut self) -> Result<u8, Error<I::Error, RST::Error>> {
+        self.get_u8(Register::AutoReset)
+    }
+    /// Write auto reset time (seconds; 0 disables).
+    pub fn set_auto_reset(&mut self, value: u8) -> Result<(), Error<I::Error, RST::Error>> {
+        self.config.auto_reset_s = value;
+        self.set_u8(Register::AutoReset, value)
+    }
+
+    /// Read long-press time (seconds).
+    pub fn long_press_time(&mut self) -> Result<u8, Error<I::Error, RST::Error>> {
+        self.get_u8(Register::LongPressTime)
+    }
+    /// Write long-press time (seconds).
+    pub fn set_long_press_time(&mut self, value: u8) -> Result<(), Error<I::Error, RST::Error>> {
+        self.config.long_press_time_s = value;
+        self.set_u8(Register::LongPressTime, value)
+    }
+
+    /// Read IO control.
+    pub fn io_ctl(&mut self) -> Result<IoCtl, Error<I::Error, RST::Error>> {
+        Ok(IoCtl::from_raw(self.get_u8(Register::IoCtl)?))
+    }
+    /// Write IO control.
+    pub fn set_io_ctl(&mut self, value: IoCtl) -> Result<(), Error<I::Error, RST::Error>> {
+        self.set_u8(Register::IoCtl, value.to_raw())
+    }
+
+    /// Read disable-auto-sleep flag (`raw != 0`).
+    pub fn disable_auto_sleep(&mut self) -> Result<bool, Error<I::Error, RST::Error>> {
+        Ok(self.get_u8(Register::DisableAutoSleep)? != 0)
+    }
+    /// Write disable-auto-sleep flag (0x01/0x00).
+    pub fn set_disable_auto_sleep(
+        &mut self,
+        value: bool,
+    ) -> Result<(), Error<I::Error, RST::Error>> {
+        self.config.disable_auto_sleep = value;
+        self.set_u8(Register::DisableAutoSleep, u8::from(value))
     }
 }
 
-impl<I, D> Cst816s<I, D>
-where
-    I: I2c<SevenBitAddress>,
-    D: DelayNs,
-{
-    /// Create a new Cst816s driver with default I2C address.
-    ///
-    /// # Arguments
-    ///
-    /// * `interface`: the `I2c<SevenBitAddress>`
-    /// * `delay`: the `DelayNs` provider
-    #[allow(clippy::missing_const_for_fn)]
-    pub fn new(interface: I, delay: D) -> Self {
-        Self {
-            interface,
-            addr: DeviceAddress::Primary,
-            _delay: delay,
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::{Gesture, TouchEventKind};
+    use crate::test_helpers::{FakeDelay, FakeI2c, FakePin};
+
+    type TestDriver = Cst816s<FakeI2c, FakeDelay, FakePin, FakePin>;
+
+    fn driver(bus: FakeI2c) -> TestDriver {
+        Cst816s::new(bus, FakeDelay::new())
+            .with_reset_pin(FakePin::new())
+            .with_interrupt_pin(FakePin::new())
     }
 
-    /// Give back the I2C interface
-    pub fn release(self) -> I {
-        self.interface
+    #[test]
+    fn probe_chip_register_path() {
+        let bus = FakeI2c::new().with_script(&[&[0xB4], &[0x03], &[0x42]]);
+        let mut d = driver(bus);
+        let info = d.probe().unwrap();
+        assert_eq!(info.chip, ChipId::Cst816s);
+        assert_eq!(info.firmware_version, 0x03);
+        assert_eq!(info.project_id, 0x42);
+        let (bus, ..) = d.release();
+        assert_eq!(bus.reads, vec![0xA7, 0xA9, 0xA8]);
     }
 
-    #[cfg(not(feature = "loglib"))]
-    #[allow(clippy::needless_pass_by_ref_mut)]
-    pub fn dump_register(&mut self) {}
+    #[test]
+    fn probe_factory_fallback_path() {
+        let bus = FakeI2c::new().with_script(&[&[0x00], &[0x11], &[0x07], &[0x09]]);
+        let mut d = driver(bus);
+        let info = d.probe().unwrap();
+        assert_eq!(info.chip, ChipId::Cst826);
+        assert_eq!(info.firmware_version, 0x07);
+        assert_eq!(info.project_id, 0x09);
+        let (bus, ..) = d.release();
+        assert_eq!(bus.reads, vec![0xA7, 0xAA, 0xA6, 0xA8]);
+    }
 
-    #[cfg(feature = "loglib")]
-    pub fn dump_register(&mut self) {
-        log::info!("read_motion_mask: {:?}", self.read_motion_mask());
-        log::info!("read_irq_pulse_width: {:?}", self.read_irq_pulse_width());
-        log::info!("read_nor_scan_per: {:?}", self.read_nor_scan_per());
-        log::info!("read_motion_s1_angle: {:?}", self.read_motion_s1_angle());
-        log::info!("read_lp_scan_raw_1: {:?}", self.read_lp_scan_raw_1());
-        log::info!("read_lp_scan_raw_2: {:?}", self.read_lp_scan_raw_2());
-        log::info!("read_lp_auto_wakeup: {:?}", self.read_lp_auto_wakeup());
-        log::info!("read_lp_scan_th: {:?}", self.read_lp_scan_th());
-        log::info!("read_lp_scan_win: {:?}", self.read_lp_scan_win());
-        log::info!("read_lp_scan_freq: {:?}", self.read_lp_scan_freq());
-        log::info!("read_lp_scan_idac: {:?}", self.read_lp_scan_idac());
-        log::info!("read_auto_sleep_time: {:?}", self.read_auto_sleep_time());
-        log::info!("read_irq_ctl: {:?}", self.read_irq_ctl());
-        log::info!("read_auto_reset: {:?}", self.read_auto_reset());
-        log::info!("read_long_press_time: {:?}", self.read_long_press_time());
-        log::info!(
-            "read_disable_auto_sleep: {:?}",
-            self.read_disable_auto_sleep()
+    #[test]
+    fn deep_sleep_resets_before_sleep_write() {
+        let mut d = driver(FakeI2c::new());
+        d.enter_deep_sleep().unwrap();
+        let (bus, delay, rst, _) = d.release();
+        assert_eq!(rst.levels, vec![false, true]);
+        assert_eq!(delay.total_ms(), 110);
+        assert_eq!(bus.writes, vec![(0x15, vec![0xE5, 0x03])]);
+    }
+
+    #[test]
+    fn read_touch_parses_frame() {
+        let bus = FakeI2c::new().with_script(&[&[0x05, 0x01, 0x01, 0x20, 0x02, 0x40]]);
+        let mut d = driver(bus);
+        let r = d.read_touch().unwrap();
+        assert_eq!(r.gesture, Gesture::SingleClick);
+        assert_eq!(r.event, TouchEventKind::Down);
+        assert_eq!((r.x, r.y), (288, 576));
+        assert!(r.pressed);
+        let (bus, ..) = d.release();
+        assert_eq!(bus.reads, vec![0x01]);
+    }
+
+    #[test]
+    fn init_transcript() {
+        let bus = FakeI2c::new().with_script(&[&[0xB4], &[0x01], &[0x02]]);
+        let mut d = driver(bus);
+        let info = d.init().unwrap();
+        assert_eq!(info.chip, ChipId::Cst816s);
+        let (bus, delay, rst, _) = d.release();
+        assert_eq!(rst.levels, vec![false, true]);
+        assert_eq!(delay.total_ms(), 110);
+        assert_eq!(bus.reads, vec![0xA7, 0xA9, 0xA8]);
+        // apply_config defaults, exact order.
+        let expected: Vec<(u8, Vec<u8>)> = [
+            (0xEC, 0x00), // MotionMask
+            (0xED, 10),   // IrqPulseWidth
+            (0xEE, 1),    // NormalScanPeriod
+            (0xEF, 0),    // MotionSlideAngle
+            (0xF9, 2),    // AutoSleepTime
+            (0xFA, 0x70), // IrqCtl
+            (0xFB, 5),    // AutoReset
+            (0xFC, 10),   // LongPressTime
+            (0xFE, 0),    // DisableAutoSleep
+        ]
+        .iter()
+        .map(|(r, v)| (0x15, vec![*r, *v]))
+        .collect();
+        assert_eq!(bus.writes, expected);
+    }
+
+    #[test]
+    fn validation_rejects_without_traffic() {
+        let mut d = driver(FakeI2c::new());
+        assert_eq!(d.set_irq_pulse_width(0), Err(Error::InvalidValue));
+        assert_eq!(d.set_irq_pulse_width(201), Err(Error::InvalidValue));
+        assert_eq!(d.set_normal_scan_period(0), Err(Error::InvalidValue));
+        assert_eq!(d.set_normal_scan_period(31), Err(Error::InvalidValue));
+        assert_eq!(d.set_lp_auto_wake_time(0), Err(Error::InvalidValue));
+        assert_eq!(d.set_lp_auto_wake_time(6), Err(Error::InvalidValue));
+        let bad_lp = LowPowerConfig {
+            auto_wake_time_min: 9,
+            ..LowPowerConfig::default()
+        };
+        assert_eq!(d.apply_low_power_config(&bad_lp), Err(Error::InvalidValue));
+        let (bus, ..) = d.release();
+        assert_eq!(bus.writes.len(), 0);
+    }
+
+    #[test]
+    fn lp_scan_raw_big_endian() {
+        let mut d = driver(FakeI2c::new());
+        d.set_lp_scan_raw1(0x1234).unwrap();
+        let (bus, ..) = d.release();
+        assert_eq!(
+            bus.writes,
+            vec![(0x15, vec![0xF0, 0x12]), (0x15, vec![0xF1, 0x34])]
         );
     }
 
-    /// Sets the Deep Sleep Mode
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn deep_sleep(&mut self) -> Result<(), Error<I::Error>> {
-        Register::DeepSleep.write(
-            &mut self.interface,
-            self.addr.into(),
-            constants::CST78XX_CMD_DEEP_SLEEP,
-        )?;
-        Ok(())
-    }
-
-    /// Returns Motion Mask
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_motion_mask(&mut self) -> Result<MotionMask, Error<I::Error>> {
-        let data = Register::MotionMask.read(&mut self.interface, self.addr.into())?;
-        Ok(MotionMask(data))
-    }
-
-    /// Writes Motion Mask
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn write_motion_mask(&mut self, value: MotionMask) -> Result<(), Error<I::Error>> {
-        Register::MotionMask.write(&mut self.interface, self.addr.into(), value.0)?;
-        Ok(())
-    }
-
-    /// Returns Interrupt low-pluse output width
-    /// Unit: 0.1ms, Range: 1～200, Default:10
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_irq_pulse_width(&mut self) -> Result<u8, Error<I::Error>> {
-        Ok(Register::IrqPluseWidth.read(&mut self.interface, self.addr.into())?)
-    }
-
-    /// Writes Interrupt low-pluse output width
-    /// Unit: 0.1ms, Range: 1～200, Default:10
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn write_irq_pulse_width(&mut self, value: u8) -> Result<(), Error<I::Error>> {
-        Register::IrqPluseWidth.write(&mut self.interface, self.addr.into(), value)?;
-        Ok(())
-    }
-
-    /// Returns Normal quick-scanning Period
-    /// This value will affect `LpAutoWakeTimeandAutoSleepTime`. Unit: 10ms, Range: 1～30,Default: 1
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_nor_scan_per(&mut self) -> Result<u8, Error<I::Error>> {
-        Ok(Register::NorScanPer.read(&mut self.interface, self.addr.into())?)
-    }
-
-    /// Writes  Normal quick-scanning Period
-    /// This value will affect `LpAutoWakeTimeandAutoSleepTime`. Unit: 10ms, Range: 1～30,Default: 1
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn write_nor_scan_per(&mut self, value: u8) -> Result<(), Error<I::Error>> {
-        Register::NorScanPer.write(&mut self.interface, self.addr.into(), value)?;
-        Ok(())
-    }
-
-    /// Returns Gesture detection sliding area angle control.
-    /// Angle=tan(c)*10 where c is the angle withrespect to the positive x-axis.
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_motion_s1_angle(&mut self) -> Result<u8, Error<I::Error>> {
-        Ok(Register::MotionSlAngle.read(&mut self.interface, self.addr.into())?)
-    }
-
-    /// Writes Gesture detection sliding area angle control.
-    /// Angle=tan(c)*10 where c is the angle withrespect to the positive x-axis.
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn write_motion_s1_angle(&mut self, value: u8) -> Result<(), Error<I::Error>> {
-        Register::MotionSlAngle.write(&mut self.interface, self.addr.into(), value)?;
-        Ok(())
-    }
-
-    /// Returns `LpScanRaw1` the the reference value for low-power scanning channel 2
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_lp_scan_raw_1(&mut self) -> Result<u16, Error<I::Error>> {
-        let high = Register::LpScanRaw1H.read(&mut self.interface, self.addr.into())?;
-        let low = Register::LpScanRaw1L.read(&mut self.interface, self.addr.into())?;
-        Ok((u16::from(high) << 8) | u16::from(low))
-    }
-
-    /// Writes  `LpScanRaw1`
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn write_lp_scan_raw_1(&mut self, value: u16) -> Result<(), Error<I::Error>> {
-        Register::LpScanRaw1H.write(
-            &mut self.interface,
-            self.addr.into(),
-            (value & 0xff00 >> 8) as u8,
-        )?;
-        Register::LpScanRaw1L.write(
-            &mut self.interface,
-            self.addr.into(),
-            (value & 0x00ff) as u8,
-        )?;
-        Ok(())
-    }
-
-    /// Returns `LpScanRaw2` the the reference value for low-power scanning channel 2
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_lp_scan_raw_2(&mut self) -> Result<u16, Error<I::Error>> {
-        let high = Register::LpScanRaw2H.read(&mut self.interface, self.addr.into())?;
-        let low = Register::LpScanRaw2L.read(&mut self.interface, self.addr.into())?;
-        Ok((u16::from(high) << 8) | u16::from(low))
-    }
-
-    /// Writes  `LpScanRaw2`
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn write_lp_scan_raw_2(&mut self, value: u16) -> Result<(), Error<I::Error>> {
-        Register::LpScanRaw2H.write(
-            &mut self.interface,
-            self.addr.into(),
-            (value & 0xff00 >> 8) as u8,
-        )?;
-        Register::LpScanRaw2L.write(
-            &mut self.interface,
-            self.addr.into(),
-            (value & 0x00ff) as u8,
-        )?;
-        Ok(())
-    }
-
-    /// Returns Automatic recalibration period duringlowpower mode. Unit: 1 minute, Range: 1～5,Default:5
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_lp_auto_wakeup(&mut self) -> Result<u8, Error<I::Error>> {
-        Ok(Register::LpAutoWakeTime.read(&mut self.interface, self.addr.into())?)
-    }
-
-    /// Returns Automatic recalibration period duringlowpower mode. Unit: 1 minute, Range: 1～5,Default:5
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn write_lp_auto_wakeup(&mut self, value: u8) -> Result<(), Error<I::Error>> {
-        Register::LpAutoWakeTime.write(&mut self.interface, self.addr.into(), value)?;
-        Ok(())
-    }
-
-    /// Returns Low power scanning wake-up threshold.Thesmaller it is, the more sensitive itis.Range: 1～255, Default: 48
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_lp_scan_th(&mut self) -> Result<u8, Error<I::Error>> {
-        Ok(Register::LpScanTH.read(&mut self.interface, self.addr.into())?)
-    }
-
-    /// Returns Low power scanning wake-up threshold.Thesmaller it is, the more sensitive itis.Range: 1～255, Default: 48
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn write_lp_scan_th(&mut self, value: u8) -> Result<(), Error<I::Error>> {
-        Register::LpScanTH.write(&mut self.interface, self.addr.into(), value)?;
-        Ok(())
-    }
-
-    /// Returns Low-power scanning measurement range.Thegreater it is, the more sensitive andthemore power consumption it is.
-    /// Range: 0, 1, 2, 3; Default: 3
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_lp_scan_win(&mut self) -> Result<u8, Error<I::Error>> {
-        Ok(Register::LpScanWin.read(&mut self.interface, self.addr.into())?)
-    }
-
-    /// Range: 0, 1, 2, 3; Default: 3
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn write_lp_scan_win(&mut self, value: u8) -> Result<(), Error<I::Error>> {
-        Register::LpScanWin.write(&mut self.interface, self.addr.into(), value)?;
-        Ok(())
-    }
-
-    /// Returns Low-power scanning frequency, the smalleritis, the more sensitive it is.
-    /// Range: 1～255; Default: 7
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_lp_scan_freq(&mut self) -> Result<u8, Error<I::Error>> {
-        Ok(Register::LpScanFreq.read(&mut self.interface, self.addr.into())?)
-    }
-
-    /// Range: 1～255; Default: 7
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn write_lp_scan_freq(&mut self, value: u8) -> Result<(), Error<I::Error>> {
-        Register::LpScanFreq.write(&mut self.interface, self.addr.into(), value)?;
-        Ok(())
-    }
-
-    /// Returns Low-power scanning current. The smalleritis,the more sensitive it is. Range: 1～255
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_lp_scan_idac(&mut self) -> Result<u8, Error<I::Error>> {
-        Ok(Register::LpScanIdac.read(&mut self.interface, self.addr.into())?)
-    }
-
-    /// Returns Low-power scanning current. The smalleritis,the more sensitive it is. Range: 1～255
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn write_lp_scan_idac(&mut self, value: u8) -> Result<(), Error<I::Error>> {
-        Register::LpScanIdac.write(&mut self.interface, self.addr.into(), value)?;
-        Ok(())
-    }
-
-    /// Returns Automatically enter low-power mode ifthereis no touch in x seconds. Unit: 1s,Default:2s.
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_auto_sleep_time(&mut self) -> Result<u8, Error<I::Error>> {
-        Ok(Register::AutoSleepTime.read(&mut self.interface, self.addr.into())?)
-    }
-
-    /// Returns Automatically enter low-power mode ifthereis no touch in x seconds. Unit: 1s,Default:2s.
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn write_auto_sleep_time(&mut self, value: u8) -> Result<(), Error<I::Error>> {
-        Register::AutoSleepTime.write(&mut self.interface, self.addr.into(), value)?;
-        Ok(())
-    }
-
-    /// Writes Irq configuration
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn write_irq_ctl(&mut self, value: IrqCtl) -> Result<(), Error<I::Error>> {
-        Register::IrqCtl.write(&mut self.interface, self.addr.into(), value.0)?;
-        Ok(())
-    }
-
-    /// Returns Irq configuration
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_irq_ctl(&mut self) -> Result<IrqCtl, Error<I::Error>> {
-        let irq_ctl = Register::IrqCtl.read(&mut self.interface, self.addr.into())?;
-        Ok(IrqCtl(irq_ctl))
-    }
-
-    /// Returns Automatically reset if there is touchbutnovalid gesture within x seconds. Unit: 1S, Disable: 0, Default:
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_auto_reset(&mut self) -> Result<u8, Error<I::Error>> {
-        Ok(Register::AutoReset.read(&mut self.interface, self.addr.into())?)
-    }
-
-    /// Writes Automatically reset if there is touch but no valid gesture within x seconds. Unit: 1S, Disable: 0, Default:
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn write_auto_reset(&mut self, value: u8) -> Result<(), Error<I::Error>> {
-        Register::AutoReset.write(&mut self.interface, self.addr.into(), value)?;
-        Ok(())
-    }
-
-    /// Returns Auto reset after long press x secondsUnit: 1S, Disable: 0, Default: 10
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_long_press_time(&mut self) -> Result<u8, Error<I::Error>> {
-        Ok(Register::LongPressTime.read(&mut self.interface, self.addr.into())?)
-    }
-
-    /// Writes Auto reset after long press x secondsUnit: 1S, Disable: 0, Default: 10
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn write_long_press_time(&mut self, value: u8) -> Result<(), Error<I::Error>> {
-        Register::LongPressTime.write(&mut self.interface, self.addr.into(), value)?;
-        Ok(())
-    }
-
-    /// Returns 0 by default, enable automatic entryintolow-power mode
-    /// When non-zero, disable automatic entryintolow-power mode
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_disable_auto_sleep(&mut self) -> Result<u8, Error<I::Error>> {
-        Ok(Register::DisAutoSleep.read(&mut self.interface, self.addr.into())?)
-    }
-
-    /// Returns the [`TouchEvent`] if it is availabe.
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_event(&mut self) -> Result<TouchEvent, Error<I::Error>> {
-        Ok(TouchEvent::read(&mut self.interface, self.addr.into())?)
-    }
-
-    /// Returns the [`TouchEvents`] if it is availabe.
-    ///
-    /// # Errors
-    ///
-    /// This method may return an error if there are communication issues with the sensor.
-    pub fn read_events(&mut self) -> Result<TouchEvents, Error<I::Error>> {
-        Ok(TouchEvents::read(&mut self.interface, self.addr.into())?)
+    #[test]
+    fn low_power_burst_frame() {
+        let mut d = driver(FakeI2c::new());
+        let lp = LowPowerConfig {
+            scan_raw1: Some(0x00FF),
+            ..LowPowerConfig::default()
+        };
+        d.apply_low_power_config(&lp).unwrap();
+        let (bus, ..) = d.release();
+        assert_eq!(
+            bus.writes,
+            vec![
+                (0x15, vec![0xF0, 0x00]),
+                (0x15, vec![0xF1, 0xFF]),
+                (0x15, vec![0xF4, 5, 48, 3, 7, 200]),
+            ]
+        );
     }
 }

@@ -8,22 +8,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    name: Build Driver
+  ci:
+    name: just ci components
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        action:
-          - command: build
-            args: --release
-          - command: fmt
-            args: --all -- --check --color always
-          - command: clippy
-            args: --all-targets --all-features --workspace -- -D warnings
-          - command: test
-            args: --verbose
-
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -33,11 +20,28 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
-          targets: thumbv7em-none-eabihf
+          targets: thumbv7m-none-eabi, thumbv7em-none-eabihf, riscv32imc-unknown-none-elf
 
       - name: Enable caching
         uses: Swatinem/rust-cache@v2
 
-      - name: Run command
-        run: cargo ${{ matrix.action.command }} ${{ matrix.action.args }}
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
 
+      - name: Format check
+        run: cargo fmt --all -- --check --color always
+
+      - name: Clippy (all features, warnings denied)
+        run: cargo clippy --all-targets --all-features --workspace -- -D warnings
+
+      - name: Test (all features)
+        run: cargo test --all-features
+
+      - name: Check each feature (thumbv7em)
+        run: cargo hack check --each-feature --target thumbv7em-none-eabihf
+
+      - name: Check each feature (riscv32imc)
+        run: cargo hack check --each-feature --target riscv32imc-unknown-none-elf
+
+      - name: Docs
+        run: cargo doc --all-features --no-deps

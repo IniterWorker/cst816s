@@ -12,6 +12,13 @@ build: check-formatting check-clippy  build-without-fmt-check
 
 build-without-fmt-check: test check-readme generate-docs
 
+# Full CI gate: format, clippy, tests, cross-target feature matrix, docs, README
+ci: check-formatting check-clippy test-all check-targets generate-docs check-readme
+
+# Check every feature combination compiles for no_std targets
+check-targets:
+    cargo hack check --each-feature --target thumbv7em-none-eabihf
+    cargo hack check --each-feature --target riscv32imc-unknown-none-elf
 # Run cargo test
 test:
     cargo test
